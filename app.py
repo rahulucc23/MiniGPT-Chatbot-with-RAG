@@ -215,7 +215,7 @@ with gr.Blocks(title="Document Query Assistant", theme=gr.themes.Soft()) as demo
 
         # Right Column: Chat Interface
         with gr.Column(scale=2):
-            chatbot = gr.Chatbot(label="Conversation", height=500, type="tuples")
+            chatbot = gr.Chatbot(label="Conversation", height=500)
             with gr.Row():
                 msg_input = gr.Textbox(
                     placeholder="Ask a question about the uploaded document...",
