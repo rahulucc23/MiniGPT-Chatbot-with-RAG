@@ -1,182 +1,239 @@
 import os
 import re
 from pathlib import Path
-from collections import defaultdict
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import gradio as gr
 import pandas as pd
+from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+# In-memory document storage
+INDEXED_RECORDS: List[Dict[str, str]] = []
+VECTORIZER: TfidfVectorizer = None
+DOC_VECTORS = None
+
 
 # ==========================================
-# 1. LIGHTWEIGHT DATA LOADER (LOW RAM)
+# 1. FILE PARSING ENGINES (CSV, PDF, TXT)
 # ==========================================
-def load_csv_data(file_paths: List[Path], max_rows_per_file: int = 2000):
-    """
-    Loads and slices CSV records directly using Pandas to stay well under 512MB RAM.
-    """
-    all_records = []
-    
-    for path in file_paths:
-        if not path.exists():
-            print(f"Skipping missing file: {path.name}")
-            continue
-            
-        print(f"Loading {path.name} (capped at {max_rows_per_file} rows)...")
-        # Load only the first N rows to guarantee staying under 512MB
+def extract_text_from_file(file_path: str) -> List[Dict[str, str]]:
+    """Extracts text content into small chunk records based on file extension."""
+    path = Path(file_path)
+    file_name = path.name
+    extracted_records = []
+
+    ext = path.suffix.lower()
+
+    # Case A: CSV Files
+    if ext == ".csv":
         try:
-            df = pd.read_csv(path, nrows=max_rows_per_file)
-            # Fill NaNs
+            df = pd.read_csv(file_path, nrows=3000)  # Safe limit for memory
             df = df.fillna("")
-            
-            for _, row in df.iterrows():
-                # Format into readable key-value context text
-                content_lines = [f"{col}: {val}" for col, val in row.items() if str(val).strip()]
-                page_content = "\n".join(content_lines)
-                
-                all_records.append({
-                    "context": page_content,
-                    "source_file": path.name,
+            for idx, row in df.iterrows():
+                lines = [f"{col}: {val}" for col, val in row.items() if str(val).strip()]
+                extracted_records.append({
+                    "context": "\n".join(lines),
+                    "source": file_name,
+                    "type": "CSV"
                 })
         except Exception as e:
-            print(f"Error loading {path.name}: {e}")
+            print(f"Error parsing CSV {file_name}: {e}")
 
-    print(f"Loaded {len(all_records)} total records into memory.")
-    return all_records
+    # Case B: PDF Files
+    elif ext == ".pdf":
+        try:
+            reader = PdfReader(file_path)
+            for page_num, page in enumerate(reader.pages):
+                text = page.extract_text()
+                if not text:
+                    continue
+                # Split large pages into ~500-word paragraphs
+                paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 30]
+                for p in paragraphs:
+                    extracted_records.append({
+                        "context": p,
+                        "source": f"{file_name} (p. {page_num + 1})",
+                        "type": "PDF"
+                    })
+        except Exception as e:
+            print(f"Error parsing PDF {file_name}: {e}")
 
-target_files = [
-    DATA_DIR / "Spotify Streaming Performance Dataset.csv",
-    DATA_DIR / "women_clothing_50k.csv"
-]
-
-records = load_csv_data(target_files, max_rows_per_file=2000)
-
-# ==========================================
-# 2. AUTO DATASET ROUTER
-# ==========================================
-class DatasetRouter:
-    def __init__(self, records: List[Dict[str, str]]):
-        self.file_keywords = defaultdict(set)
-        self._build_keyword_registry(records)
-
-    def _build_keyword_registry(self, records):
-        for rec in records:
-            source = rec["source_file"]
-            for line in rec["context"].split("\n"):
-                if ": " in line:
-                    key, val = line.split(": ", 1)
-                    for word in re.findall(r"\w+", key.lower()):
-                        if len(word) > 2:
-                            self.file_keywords[source].add(word)
-
-                    val_words = [w for w in re.findall(r"\w+", val.lower()) if 3 <= len(w) <= 15]
-                    self.file_keywords[source].update(val_words[:4])
-
-    def route_query(self, query: str) -> str:
-        query_terms = set(re.findall(r"\w+", query.lower()))
-        scores = {}
-        for source_file, kws in self.file_keywords.items():
-            scores[source_file] = len(query_terms.intersection(kws))
-        if not scores:
-            return None
-        best_match = max(scores, key=scores.get)
-        return best_match if scores[best_match] > 0 else None
-
-# ==========================================
-# 3. TF-IDF VECTOR RETRIEVER (< 50MB RAM)
-# ==========================================
-class MemorySafeRetriever:
-    def __init__(self, records: List[Dict[str, str]], router: DatasetRouter):
-        self.records = records
-        self.router = router
-        self.corpus = [r["context"] for r in records]
-        
-        # Fit vectorizer on vocabulary
-        if self.corpus:
-            self.vectorizer = TfidfVectorizer(stop_words="english", max_features=10000)
-            self.doc_vectors = self.vectorizer.fit_transform(self.corpus)
-        else:
-            self.vectorizer = None
-            self.doc_vectors = None
-
-    def retrieve(self, query: str, top_k: int = 3):
-        if not self.corpus or self.vectorizer is None:
-            return []
-
-        # 1. Routing
-        target_file = self.router.route_query(query)
-        
-        # 2. Vector search via Cosine Similarity
-        query_vec = self.vectorizer.transform([query])
-        similarities = cosine_similarity(query_vec, self.doc_vectors).flatten()
-
-        query_words = [w.lower() for w in re.findall(r"\w+", query) if len(w) > 2]
-        scored_candidates = []
-
-        for idx, score in enumerate(similarities):
-            rec = self.records[idx]
-            
-            # Apply source filter if routed
-            if target_file and rec["source_file"] != target_file:
-                continue
-
-            doc_text = rec["context"].lower()
-            exact_hits = sum(1 for kw in query_words if kw in doc_text)
-            
-            # Boost exact keyword matches
-            hybrid_score = (exact_hits * 5.0) + float(score)
-
-            if hybrid_score > 0.05:
-                scored_candidates.append({
-                    "context": rec["context"],
-                    "source_file": rec["source_file"],
-                    "score": float(score),
-                    "hybrid_score": hybrid_score
+    # Case C: TXT / Markdown
+    elif ext in [".txt", ".md", ".log"]:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            paragraphs = [p.strip() for p in content.split("\n\n") if len(p.strip()) > 20]
+            for p in paragraphs:
+                extracted_records.append({
+                    "context": p,
+                    "source": file_name,
+                    "type": "TXT"
                 })
+        except Exception as e:
+            print(f"Error parsing text file {file_name}: {e}")
 
-        scored_candidates.sort(key=lambda x: x["hybrid_score"], reverse=True)
-        return scored_candidates[:top_k]
+    return extracted_records
 
-router = DatasetRouter(records)
-retriever = MemorySafeRetriever(records, router)
 
 # ==========================================
-# 4. CHAT LOGIC & GRADIO UI
+# 2. VECTOR INDEXING (LOW RAM TF-IDF)
 # ==========================================
-def answer_user_query(message: str, history: list) -> str:
-    if not message.strip():
-        return "Please enter a valid search query."
+def process_and_index_files(uploaded_files) -> str:
+    """Takes uploaded files, parses them, and updates the vector search matrix."""
+    global INDEXED_RECORDS, VECTORIZER, DOC_VECTORS
 
-    if not records:
-        return "No CSV records found. Please ensure the CSV files are placed inside the `data/` folder."
+    if not uploaded_files:
+        return "⚠️ No files were uploaded."
 
-    results = retriever.retrieve(message, top_k=3)
+    INDEXED_RECORDS = []
+    total_docs = 0
+
+    for file in uploaded_files:
+        # file.name holds the local temporary path on disk
+        parsed_chunks = extract_text_from_file(file.name)
+        INDEXED_RECORDS.extend(parsed_chunks)
+        total_docs += len(parsed_chunks)
+
+    if not INDEXED_RECORDS:
+        return "❌ Could not extract any readable text from the uploaded file(s)."
+
+    # Fit TF-IDF Vectorizer
+    corpus = [item["context"] for item in INDEXED_RECORDS]
+    VECTORIZER = TfidfVectorizer(stop_words="english", max_features=12000)
+    DOC_VECTORS = VECTORIZER.fit_transform(corpus)
+
+    file_names = ", ".join([Path(f.name).name for f in uploaded_files])
+    return f"✅ Successfully processed {len(uploaded_files)} file(s): **{file_names}** ({len(INDEXED_RECORDS)} total chunks indexed into memory)."
+
+
+# ==========================================
+# 3. SEARCH & RETRIEVAL LOGIC
+# ==========================================
+def search_index(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    global INDEXED_RECORDS, VECTORIZER, DOC_VECTORS
+
+    if not INDEXED_RECORDS or VECTORIZER is None or DOC_VECTORS is None:
+        return []
+
+    # 1. Sparse vector similarity
+    query_vec = VECTORIZER.transform([query])
+    similarities = cosine_similarity(query_vec, DOC_VECTORS).flatten()
+
+    query_terms = [w.lower() for w in re.findall(r"\w+", query) if len(w) > 2]
+    scored_candidates = []
+
+    for idx, score in enumerate(similarities):
+        doc = INDEXED_RECORDS[idx]
+        text_lower = doc["context"].lower()
+        
+        # Boost matches with exact keyword hits
+        exact_matches = sum(1 for term in query_terms if term in text_lower)
+        hybrid_score = (exact_matches * 3.0) + float(score)
+
+        if hybrid_score > 0.02:
+            scored_candidates.append({
+                "context": doc["context"],
+                "source": doc["source"],
+                "type": doc["type"],
+                "score": float(score),
+                "hybrid_score": hybrid_score
+            })
+
+    scored_candidates.sort(key=lambda x: x["hybrid_score"], reverse=True)
+    return scored_candidates[:top_k]
+
+
+def answer_query(user_message: str, chat_history: list) -> Tuple[str, list]:
+    if not user_message.strip():
+        return "", chat_history
+
+    if not INDEXED_RECORDS:
+        bot_response = "⚠️ No files have been uploaded yet! Please upload a CSV, PDF, or TXT file using the sidebar first."
+        chat_history.append((user_message, bot_response))
+        return "", chat_history
+
+    results = search_index(user_message, top_k=3)
+
     if not results:
-        return f"No matching records found for: *'{message}'*."
+        bot_response = f"No relevant information found in the uploaded documents for: *'{user_message}'*."
+    else:
+        output_parts = [f"### Results for: *'{user_message}'*\n"]
+        for idx, item in enumerate(results, 1):
+            content = item["context"].strip()
+            source = item["source"]
+            doc_type = item["type"]
+            score = item["score"]
 
-    output_lines = [f"### Results for: *'{message}'*\n"]
-    for idx, item in enumerate(results, 1):
-        content = item["context"].strip()
-        source = item["source_file"]
-        score = item["score"]
+            output_parts.append(f"**Result #{idx}** (Source: `{source}` | Type: `{doc_type}` | Score: `{score:.3f}`)")
 
-        output_lines.append(f"**Result #{idx}** (Source: `{source}` | Similarity: `{score:.3f}`)")
-        for line in content.split("\n"):
-            if ": " in line:
-                k, v = line.split(": ", 1)
-                output_lines.append(f"- **{k.strip().title()}**: {v.strip()}")
-        output_lines.append("\n---\n")
+            # Render key-values cleanly if CSV row
+            if doc_type == "CSV" and ": " in content:
+                for line in content.split("\n"):
+                    if ": " in line:
+                        k, v = line.split(": ", 1)
+                        output_parts.append(f"- **{k.strip().title()}**: {v.strip()}")
+            else:
+                output_parts.append(f"> {content}")
 
-    return "\n".join(output_lines)
+            output_parts.append("\n---\n")
+
+        bot_response = "\n".join(output_parts)
+
+    chat_history.append((user_message, bot_response))
+    return "", chat_history
+
+
+# ==========================================
+# 4. GRADIO DUAL-COLUMN UI
+# ==========================================
+with gr.Blocks(title="Document Query Assistant", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 📄 Universal File RAG Assistant")
+    gr.Markdown("Upload any **CSV, PDF, or TXT** file, let it index, and ask questions directly.")
+
+    with gr.Row():
+        # Left Column: File upload & Status
+        with gr.Column(scale=1):
+            file_uploader = gr.File(
+                label="Upload File(s)",
+                file_types=[".csv", ".pdf", ".txt", ".md"],
+                file_count="multiple"
+            )
+            upload_btn = gr.Button("Index Uploaded Files", variant="primary")
+            status_output = gr.Markdown("⏳ Waiting for file upload...")
+
+            upload_btn.click(
+                fn=process_and_index_files,
+                inputs=[file_uploader],
+                outputs=[status_output]
+            )
+
+        # Right Column: Chat Interface
+        with gr.Column(scale=2):
+            chatbot = gr.Chatbot(label="Conversation", height=500)
+            with gr.Row():
+                msg_input = gr.Textbox(
+                    placeholder="Ask a question about the uploaded document...",
+                    show_label=False,
+                    scale=8
+                )
+                submit_btn = gr.Button("Search", variant="primary", scale=1)
+
+            clear_btn = gr.ClearButton([msg_input, chatbot])
+
+            # Trigger on Enter or Click
+            submit_btn.click(
+                fn=answer_query,
+                inputs=[msg_input, chatbot],
+                outputs=[msg_input, chatbot]
+            )
+            msg_input.submit(
+                fn=answer_query,
+                inputs=[msg_input, chatbot],
+                outputs=[msg_input, chatbot]
+            )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo = gr.ChatInterface(
-        fn=answer_user_query,
-        title="Lightweight CSV Assistant",
-        description="Low-memory RAG Assistant optimized for Render Free Tier (512MB RAM)."
-    )
     demo.launch(server_name="0.0.0.0", server_port=port)
