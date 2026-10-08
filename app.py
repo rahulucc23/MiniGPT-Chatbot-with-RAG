@@ -149,9 +149,13 @@ def answer_query(user_message: str, chat_history: list) -> Tuple[str, list]:
     if not user_message.strip():
         return "", chat_history
 
+    if chat_history is None:
+        chat_history = []
+
     if not INDEXED_RECORDS:
         bot_response = "⚠️ No files have been uploaded yet! Please upload a CSV, PDF, or TXT file using the sidebar first."
-        chat_history.append((user_message, bot_response))
+        chat_history.append({"role": "user", "content": user_message})
+        chat_history.append({"role": "assistant", "content": bot_response})
         return "", chat_history
 
     results = search_index(user_message, top_k=3)
@@ -168,7 +172,6 @@ def answer_query(user_message: str, chat_history: list) -> Tuple[str, list]:
 
             output_parts.append(f"**Result #{idx}** (Source: `{source}` | Type: `{doc_type}` | Score: `{score:.3f}`)")
 
-            # Render key-values cleanly if CSV row
             if doc_type == "CSV" and ": " in content:
                 for line in content.split("\n"):
                     if ": " in line:
@@ -181,7 +184,8 @@ def answer_query(user_message: str, chat_history: list) -> Tuple[str, list]:
 
         bot_response = "\n".join(output_parts)
 
-    chat_history.append((user_message, bot_response))
+    chat_history.append({"role": "user", "content": user_message})
+    chat_history.append({"role": "assistant", "content": bot_response})
     return "", chat_history
 
 
@@ -211,7 +215,7 @@ with gr.Blocks(title="Document Query Assistant", theme=gr.themes.Soft()) as demo
 
         # Right Column: Chat Interface
         with gr.Column(scale=2):
-            chatbot = gr.Chatbot(label="Conversation", height=500)
+            chatbot = gr.Chatbot(label="Conversation", height=500, type="tuples")
             with gr.Row():
                 msg_input = gr.Textbox(
                     placeholder="Ask a question about the uploaded document...",
